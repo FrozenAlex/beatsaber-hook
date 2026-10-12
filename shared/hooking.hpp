@@ -1,5 +1,6 @@
 #pragma once
 
+#include "byref.hpp"
 #include "find.hpp"
 #include "flamingo/shared/hook-data.hpp"
 #include "flamingo/shared/hook-metadata.hpp"
@@ -95,17 +96,74 @@ namespace i2c {
             }
         };
 
-        // Used to check overloaded match hooks against the parameter list
-        template <auto C, typename T>
-        // Default fallback to static method type
-        struct method_check {
-            using type = remove_last_param_t<MethodInfo*, T>;
+        template <typename T>
+        struct toggle_byref_const {
+            using type = T;
         };
-        template <auto C, typename R, typename T, typename... Ts>
-        // Uses C (a constexpr verification function) to see if an instance method (and a particular overload) can be used
-        requires(C.template operator()<remove_last_param_t<MethodInfo*, method_ptr_t<T, R, Ts...>>>())
-        struct method_check<C, R (*)(T*, Ts...)> {
-            using type = remove_last_param_t<MethodInfo*, method_ptr_t<T, R, Ts...>>;
+        template <typename T>
+        struct toggle_byref_const<by_ref<T>> {
+            using type = by_ref<std::conditional_t<std::is_const_v<T>, std::remove_const_t<T>, std::add_const_t<T>>>;
+        };
+
+        // Rebuild the signature, trying both constness choices for each by_ref.
+        template <auto C, template <typename...> typename Ptr, typename Selected, typename Remaining>
+        struct byref_matches;
+        template <auto C, template <typename...> typename Ptr, typename... Selected>
+        struct byref_matches<C, Ptr, std::tuple<Selected...>, std::tuple<>> {
+            using candidate = Ptr<Selected...>;
+            using type = std::conditional_t<C.template operator()<candidate>(), std::tuple<candidate>, std::tuple<>>;
+        };
+        template <auto C, template <typename...> typename Ptr, typename... Selected, typename First, typename... Rest>
+        struct byref_matches<C, Ptr, std::tuple<Selected...>, std::tuple<First, Rest...>> {
+            using other = typename toggle_byref_const<First>::type;
+            using original = typename byref_matches<C, Ptr, std::tuple<Selected..., First>, std::tuple<Rest...>>::type;
+            using changed = typename byref_matches<C, Ptr, std::tuple<Selected..., other>, std::tuple<Rest...>>::type;
+            using type =
+                std::conditional_t<std::is_same_v<First, other>, original, decltype(std::tuple_cat(std::declval<original>(), std::declval<changed>()))>;
+        };
+
+        template <auto C, typename Signature>
+        struct hook_method_matches {
+            using type = std::tuple<>;
+        };
+        template <auto C, typename R, typename... Args>
+        struct hook_method_matches<C, function_ptr_t<R, Args...>> : byref_matches<C, function_ptr_t, std::tuple<R>, std::tuple<Args...>> {};
+        template <auto C, typename I, typename R, typename... Args>
+        struct hook_method_matches<C, method_ptr_t<I, R, Args...>> : byref_matches<C, method_ptr_t, std::tuple<I, R>, std::tuple<Args...>> {};
+
+        template <typename T>
+        struct hook_instance_type {
+            using type = void;
+        };
+        template <typename R, typename I, typename... Args>
+        requires(std::is_class_v<I> || std::is_union_v<I>)
+        struct hook_instance_type<function_ptr_t<R, I*, Args...>> {
+            using type = remove_last_param_t<MethodInfo*, method_ptr_t<I, R, Args...>>;
+        };
+
+        // Exact overloads win; otherwise require a unique constness-adjusted match.
+        template <auto C, typename T>
+        struct method_check {
+            using static_type = remove_last_param_t<MethodInfo*, T>;
+            using instance_type = typename hook_instance_type<T>::type;
+            using type = typename decltype([] {
+                if constexpr (!std::is_void_v<instance_type> && C.template operator()<instance_type>()) {
+                    return std::type_identity<instance_type>{};
+                } else if constexpr (C.template operator()<static_type>()) {
+                    return std::type_identity<static_type>{};
+                } else {
+                    using matches = decltype(std::tuple_cat(
+                        std::declval<typename hook_method_matches<C, static_type>::type>(),
+                        std::declval<typename hook_method_matches<C, instance_type>::type>()
+                    ));
+                    static_assert(std::tuple_size_v<matches> <= 1, "Hook method signature is ambiguous after changing by_ref constness!");
+                    if constexpr (std::tuple_size_v<matches> == 1) {
+                        return std::type_identity<std::tuple_element_t<0, matches>>{};
+                    } else {
+                        return std::type_identity<static_type>{};
+                    }
+                }
+            }())::type;
         };
 
         template <auto M>
@@ -197,6 +255,7 @@ namespace i2c {
 
 // Defines a hook to a method with metadata provided through i2c::metadata_getter.
 // Will automatically cast overloads, check types, and detect static/instance methods, based on the given return type and parameters.
+// by_ref parameters may differ in constness from the target; exact matches take precedence and ambiguous fallbacks are rejected.
 // Generic methods cannot be hooked with this macro.
 #define MAKE_HOOK_MATCH(name_, method, ret_type, ...)                                                                            \
     struct BS_HOOK_HIDDEN hook_##name_ {                                                                                         \
