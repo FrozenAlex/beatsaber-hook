@@ -75,6 +75,16 @@ namespace i2c {
         template <typename D, typename T>
         using remove_last_param_t = remove_last_param<D, T>::type;
 
+        // Strip at most one hidden metadata argument, accepting either pointer constness.
+        template <typename T>
+        using remove_method_info_t = std::conditional_t<
+            std::is_same_v<T, remove_last_param_t<MethodInfo*, T>>,
+            remove_last_param_t<MethodInfo const*, T>,
+            remove_last_param_t<MethodInfo*, T>>;
+
+        template <typename T>
+        constexpr bool is_method_info_v = std::is_same_v<T, MethodInfo*> || std::is_same_v<T, MethodInfo const*>;
+
         // A struct to find methods for hooks based on their function type and user-specified parameters
         template <typename T>
         struct resolve_addr;
@@ -91,45 +101,63 @@ namespace i2c {
             auto operator()(auto addr) { return (void*) addr; }
             auto operator()(MethodInfo const* addr) { return addr; }
             auto operator()(find_class_info klass, std::string_view name, bool instance = std::is_pointer_v<T1> && type_check::full_class<T1>) {
-                int args = sizeof...(TArgs) + int(!instance) - int(std::is_same_v<last_t<T1, TArgs...>, MethodInfo*>);
+                int args = sizeof...(TArgs) + int(!instance) - int(is_method_info_v<last_t<T1, TArgs...>>);
                 return find_method(klass, {name, args});
             }
         };
 
+        // Hooks share the target's calling convention, so conversions must preserve representation.
+        // Only a byref referent's top-level constness is ignored; nested pointer types stay exact.
         template <typename T>
-        struct toggle_byref_const {
-            using type = T;
+        struct hook_type {
+            using type = std::remove_const_t<T>;
         };
         template <typename T>
-        struct toggle_byref_const<by_ref<T>> {
-            using type = by_ref<std::conditional_t<std::is_const_v<T>, std::remove_const_t<T>, std::add_const_t<T>>>;
+        struct hook_type<by_ref<T>> {
+            using type = by_ref<std::remove_const_t<T>>;
         };
+        template <typename From, typename To>
+        constexpr bool hook_type_compatible =
+            std::is_same_v<typename hook_type<std::remove_const_t<From>>::type, typename hook_type<std::remove_const_t<To>>::type>;
 
-        // Rebuild the signature, trying both constness choices for each by_ref.
-        template <auto C, template <typename...> typename Ptr, typename Selected, typename Remaining>
-        struct byref_matches;
-        template <auto C, template <typename...> typename Ptr, typename... Selected>
-        struct byref_matches<C, Ptr, std::tuple<Selected...>, std::tuple<>> {
-            using candidate = Ptr<Selected...>;
-            using type = std::conditional_t<C.template operator()<candidate>(), std::tuple<candidate>, std::tuple<>>;
-        };
-        template <auto C, template <typename...> typename Ptr, typename... Selected, typename First, typename... Rest>
-        struct byref_matches<C, Ptr, std::tuple<Selected...>, std::tuple<First, Rest...>> {
-            using other = typename toggle_byref_const<First>::type;
-            using original = typename byref_matches<C, Ptr, std::tuple<Selected..., First>, std::tuple<Rest...>>::type;
-            using changed = typename byref_matches<C, Ptr, std::tuple<Selected..., other>, std::tuple<Rest...>>::type;
-            using type =
-                std::conditional_t<std::is_same_v<First, other>, original, decltype(std::tuple_cat(std::declval<original>(), std::declval<changed>()))>;
-        };
+        template <typename HookArgs, typename MethodArgs>
+        constexpr bool hook_parameters_compatible = []<size_t... Is>(std::index_sequence<Is...>) {
+            if constexpr (std::tuple_size_v<HookArgs> != std::tuple_size_v<MethodArgs>) {
+                return false;
+            } else {
+                return (hook_type_compatible<std::tuple_element_t<Is, HookArgs>, std::tuple_element_t<Is, MethodArgs>> && ...);
+            }
+        }(std::make_index_sequence<std::tuple_size_v<HookArgs>>{});
 
-        template <auto C, typename Signature>
-        struct hook_method_matches {
-            using type = std::tuple<>;
+        template <typename Hook, typename Method>
+        struct hook_signature_compatible : std::false_type {};
+        template <typename HR, typename... HArgs, typename MR, typename... MArgs>
+        struct hook_signature_compatible<function_ptr_t<HR, HArgs...>, function_ptr_t<MR, MArgs...>> :
+            std::bool_constant<hook_type_compatible<HR, MR> && hook_parameters_compatible<std::tuple<HArgs...>, std::tuple<MArgs...>>> {};
+
+        // Metadata historically uses function_ptr_t/method_ptr_t, which erase noexcept.
+        // Comparison also makes the implicit instance parameter explicit.
+        template <typename T>
+        struct hook_signature {
+            using metadata_type = T;
+            using function_type = T;
         };
-        template <auto C, typename R, typename... Args>
-        struct hook_method_matches<C, function_ptr_t<R, Args...>> : byref_matches<C, function_ptr_t, std::tuple<R>, std::tuple<Args...>> {};
-        template <auto C, typename I, typename R, typename... Args>
-        struct hook_method_matches<C, method_ptr_t<I, R, Args...>> : byref_matches<C, method_ptr_t, std::tuple<I, R>, std::tuple<Args...>> {};
+        template <typename I, typename R, typename... Args>
+        struct hook_signature<method_ptr_t<I, R, Args...>> {
+            using metadata_type = method_ptr_t<I, R, Args...>;
+            using function_type = function_ptr_t<R, I*, Args...>;
+        };
+        template <typename R, typename... Args>
+        struct hook_signature<R (*)(Args...) noexcept> : hook_signature<function_ptr_t<R, Args...>> {};
+        template <typename I, typename R, typename... Args>
+        struct hook_signature<R (I::*)(Args...) noexcept> : hook_signature<method_ptr_t<I, R, Args...>> {};
+
+        // The first template parameter makes deduction dependent in the macro's requires expression,
+        // so an unresolved overload set can fail safely while a single target exposes its actual type.
+        template <typename, typename T>
+        constexpr std::type_identity<T> hook_target_type(T) {
+            return {};
+        }
 
         template <typename T>
         struct hook_instance_type {
@@ -138,32 +166,30 @@ namespace i2c {
         template <typename R, typename I, typename... Args>
         requires(std::is_class_v<I> || std::is_union_v<I>)
         struct hook_instance_type<function_ptr_t<R, I*, Args...>> {
-            using type = remove_last_param_t<MethodInfo*, method_ptr_t<I, R, Args...>>;
+            using type = method_ptr_t<I, R, Args...>;
         };
 
-        // Exact overloads win; otherwise require a unique constness-adjusted match.
-        template <auto C, typename T>
+        // Known targets need only per-type comparison. Unresolved overload sets get at most
+        // two exact probes (instance, then static); conversions require an explicit selection.
+        template <auto CanCast, typename Hook, typename Method = void>
         struct method_check {
-            using static_type = remove_last_param_t<MethodInfo*, T>;
-            using instance_type = typename hook_instance_type<T>::type;
+            using static_type = remove_method_info_t<Hook>;
             using type = typename decltype([] {
-                if constexpr (!std::is_void_v<instance_type> && C.template operator()<instance_type>()) {
-                    return std::type_identity<instance_type>{};
-                } else if constexpr (C.template operator()<static_type>()) {
-                    return std::type_identity<static_type>{};
+                if constexpr (!std::is_void_v<Method>) {
+                    return std::type_identity<typename hook_signature<Method>::metadata_type>{};
                 } else {
-                    using matches = decltype(std::tuple_cat(
-                        std::declval<typename hook_method_matches<C, static_type>::type>(),
-                        std::declval<typename hook_method_matches<C, instance_type>::type>()
-                    ));
-                    static_assert(std::tuple_size_v<matches> <= 1, "Hook method signature is ambiguous after changing by_ref constness!");
-                    if constexpr (std::tuple_size_v<matches> == 1) {
-                        return std::type_identity<std::tuple_element_t<0, matches>>{};
-                    } else {
+                    using instance_type = typename hook_instance_type<static_type>::type;
+                    if constexpr (!std::is_void_v<instance_type> && CanCast.template operator()<instance_type>()) {
+                        return std::type_identity<instance_type>{};
+                    } else if constexpr (CanCast.template operator()<static_type>()) {
                         return std::type_identity<static_type>{};
+                    } else {
+                        return std::type_identity<void>{};
                     }
                 }
             }())::type;
+            static constexpr bool resolved = !std::is_void_v<type>;
+            static constexpr bool valid = hook_signature_compatible<static_type, typename hook_signature<type>::function_type>::value;
         };
 
         template <auto M>
@@ -255,17 +281,35 @@ namespace i2c {
 
 // Defines a hook to a method with metadata provided through i2c::metadata_getter.
 // Will automatically cast overloads, check types, and detect static/instance methods, based on the given return type and parameters.
-// by_ref parameters may differ in constness from the target; exact matches take precedence and ambiguous fallbacks are rejected.
+// Return and parameter types are checked individually; by_ref referents may differ in top-level constness.
+// A trailing MethodInfo* or MethodInfo const* is optional. Overloads resolve automatically only for exact signatures.
+// To convert an overloaded target, select it explicitly with static_cast using a function_ptr_t/method_ptr_t alias.
 // Generic methods cannot be hooked with this macro.
-#define MAKE_HOOK_MATCH(name_, method, ret_type, ...)                                                                            \
-    struct BS_HOOK_HIDDEN hook_##name_ {                                                                                         \
-        static constexpr auto cast_test = []<typename T>() { return requires { static_cast<T>(method); }; };                     \
-        using func_t = ret_type (*)(__VA_ARGS__);                                                                                \
-        using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                    \
-        static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
-        static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                  \
-        __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
-    };                                                                                                                           \
+#define MAKE_HOOK_MATCH(name_, method, ret_type, ...)                                                                                \
+    struct BS_HOOK_HIDDEN hook_##name_ {                                                                                             \
+        static constexpr auto cast_test = []<typename T>() { return requires { static_cast<T>(method); }; };                         \
+        static constexpr auto target_type = []<typename T>() {                                                                       \
+            if constexpr (requires { ::i2c::detail::hook_target_type<T>(method); }) {                                                \
+                return ::i2c::detail::hook_target_type<T>(method);                                                                   \
+            } else {                                                                                                                 \
+                return std::type_identity<void>{};                                                                                   \
+            }                                                                                                                        \
+        };                                                                                                                           \
+        using func_t = ret_type (*)(__VA_ARGS__);                                                                                    \
+        using match_t = ::i2c::detail::method_check<cast_test, func_t, typename decltype(target_type.operator()<func_t>())::type>;   \
+        using cast_t = typename match_t::type;                                                                                       \
+        static_assert(match_t::resolved, "Cannot resolve overloaded hook target; select an overload explicitly with static_cast.");  \
+        static_assert(!match_t::resolved || match_t::valid, "Hook method signature does not match!");                                \
+        static constexpr auto metadata = []<typename Match>() {                                                                      \
+            if constexpr (Match::valid) {                                                                                            \
+                static_assert(::i2c::detail::match_hookable<static_cast<typename Match::type>(method)>, "Method cannot be hooked!"); \
+                return &::i2c::metadata_getter<static_cast<typename Match::type>(method)>::method_info;                              \
+            } else {                                                                                                                 \
+                return +[]() -> MethodInfo const* { return nullptr; };                                                               \
+            }                                                                                                                        \
+        }.operator()<match_t>();                                                                                                     \
+        __INTERNAL_HOOK_STRUCT(name_, metadata(), ret_type, __VA_ARGS__)                                                             \
+    };                                                                                                                               \
     ret_type hook_##name_::hook_m_##name_(__VA_ARGS__)
 
 // Tells a hook to be installed as the final hook, if other hooks are installed to the same target.
