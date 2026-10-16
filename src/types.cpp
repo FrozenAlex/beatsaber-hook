@@ -217,17 +217,8 @@ char const* i2c::type_simple_name(Il2CppType const* type) {
 bool i2c::is_convertible_from(Il2CppType const* to, Il2CppType const* from, bool args) {
     RET_DEF_UNLESS(logger, to);
     RET_DEF_UNLESS(logger, from);
-    if (args) {
-        if (to->byref && !from->byref) {
-            // logger.debug(
-            //     "to ({}, {}) is ref/out while from ({}, {}) is not. Not convertible.",
-            //     type_simple_name(to),
-            //     fmt::ptr(to),
-            //     type_simple_name(from),
-            //     fmt::ptr(from)
-            // );
-            return false;
-        }
+    if (args && to->byref != from->byref) {
+        return false;
     }
     functions::initialize();
     auto class_to = functions::class_from_il2cpp_type(to);

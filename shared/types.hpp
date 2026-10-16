@@ -44,7 +44,7 @@ namespace i2c {
     // Gets a C# name of a type
     char const* type_simple_name(Il2CppType const* type);
 
-    // Returns if a type can be converted to another, optionally ignoring byrefs if not as args
+    // Returns if a type can be converted to another. Argument matching requires equal byref status.
     bool is_convertible_from(Il2CppType const* to, Il2CppType const* from, bool args = false);
 
     enum struct match { none, convertible, exact };
